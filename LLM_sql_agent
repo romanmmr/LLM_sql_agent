@@ -1,0 +1,120 @@
+import os
+import pandas as pd
+import ast
+from dotenv import load_dotenv
+import requests, pathlib
+
+from langchain_openai import ChatOpenAI
+from langchain_community.utilities import SQLDatabase
+from langchain_community.agent_toolkits import SQLDatabaseToolkit
+from langchain.agents import create_agent
+
+
+load_dotenv()
+openai_api_key = os.environ["OPENAI_API_KEY"]
+
+llm = ChatOpenAI(model="gpt-3.5-turbo-0125") # This is a legacy model (not expensive), only for dev purposes
+# llm = ChatOpenAI(model="gpt-4.1-nano")  # Use GPT-4 for better results
+
+
+sqlite_db_name = "street_tree_db.sqlite"
+
+sqlite_db_path = os.path.join(pathlib.Path(__file__).resolve().parent, sqlite_db_name)
+
+db = SQLDatabase.from_uri(f"sqlite:///{sqlite_db_path}")
+
+
+# # I we want to check the table as a pandas dataframe un-comment the following lines
+# string_column_names = db.run("PRAGMA table_info('street_trees');")
+# column_names = [col.split(', ')[1].strip("'") for col in string_column_names.split('), (')]
+
+# print("\nColumn names:")
+# print(column_names)
+# print(f"\n{'-'*50}\n")
+
+# try:
+#     # Safely convert the string representation of a list of tuples 
+#     # back into a real Python list of tuples
+#     data_list_of_tuples = ast.literal_eval(db.run("SELECT * FROM street_trees LIMIT 5;"))
+
+#     # Convert the list of tuples directly into a pandas DataFrame
+#     df = pd.DataFrame(data_list_of_tuples, columns=column_names)
+
+#     print("--- Successfully Created DataFrame ---")
+
+# except ValueError as e:
+#     print(f"Error during conversion: {e}")
+#     print("The string format is likely incorrect. It must be a valid Python list representation.")
+
+
+toolkit = SQLDatabaseToolkit(db=db, llm=llm)
+
+tools = toolkit.get_tools()
+
+for tool in tools:
+    print(f"{tool.name}: {tool.description}\n")
+
+
+# Ideally this prompt would be part of another file or module
+# It should not be part of the main code running the agent
+# However, for simplicity and illustrative purposes, we include it here
+system_prompt = """
+You are an agent designed to interact with a SQL database.
+Given an input question, create a syntactically correct {dialect} query to run,
+then look at the results of the query and return the answer. Unless the user
+specifies a specific number of examples they wish to obtain, always limit your
+query to at most {top_k} results.
+
+You can order the results by a relevant column to return the most interesting
+examples in the database. Never query for all the columns from a specific table,
+only ask for the relevant columns given the question.
+
+You MUST double check your query before executing it. If you get an error while
+executing a query, rewrite the query and try again.
+
+DO NOT make any DML statements (INSERT, UPDATE, DELETE, DROP etc.) to the
+database.
+
+To start you should ALWAYS look at the tables in the database to see what you
+can query. Do NOT skip this step.
+
+Then you should query the schema of the most relevant tables.
+""".format(
+    dialect=db.dialect,
+    top_k=5,
+)
+
+
+sql_agent = create_agent(
+    model=llm,
+    tools=tools,
+    system_prompt=system_prompt,
+)
+
+# Ideally this question would come from an external input
+# For simplicity and illustrative purposes, we define it here
+question = "How many types of plants are there in the street_trees database? Please provide the answer only as a number."
+
+for step in sql_agent.stream(
+    {"messages": [{"role": "user", "content": question}]},
+    stream_mode="values",
+):
+    step["messages"][-1].pretty_print()
+
+
+# The expected answer is just a number: 148
+# I got the followging answer from the agent:
+# The total number of plant types in the street_trees database is 148.
+
+# To double check we can run the following:
+# load the database as a pandas dataframe and run the nunique() method on the 'qSpecies' column
+data_list_of_tuples = ast.literal_eval(db.run("SELECT * FROM street_trees;"))
+
+string_column_names = db.run("PRAGMA table_info('street_trees');")
+column_names = [col.split(', ')[1].strip("'") for col in string_column_names.split('), (')]
+
+# Convert the list of tuples directly into a pandas DataFrame
+df = pd.DataFrame(data_list_of_tuples, columns=column_names)
+
+print(df['qSpecies'].nunique())
+# The output should be 148
