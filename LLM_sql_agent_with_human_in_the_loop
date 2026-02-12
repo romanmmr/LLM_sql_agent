@@ -1,0 +1,346 @@
+import os
+import pandas as pd
+import ast
+from dotenv import load_dotenv
+import requests, pathlib
+
+from langchain_openai import ChatOpenAI
+from langchain_community.utilities import SQLDatabase
+from langchain_community.agent_toolkits import SQLDatabaseToolkit
+
+from langchain.agents import create_agent, AgentState
+from langgraph.checkpoint.memory import InMemorySaver
+from langchain.agents.middleware import HumanInTheLoopMiddleware
+from langchain.messages import HumanMessage
+from langgraph.types import Command
+from pprint import pprint
+from langchain.tools import tool, ToolRuntime
+
+
+load_dotenv()
+openai_api_key = os.environ["OPENAI_API_KEY"]
+
+llm = ChatOpenAI(model="gpt-4o-mini")
+# llm = ChatOpenAI(model="gpt-4.1-nano")  # Use GPT-4 for better results
+
+
+sqlite_db_name = "street_tree_db.sqlite"
+
+sqlite_db_path = os.path.join(pathlib.Path(__file__).resolve().parent, sqlite_db_name)
+
+db = SQLDatabase.from_uri(f"sqlite:///{sqlite_db_path}")
+
+
+class SQLAgentState(AgentState):
+    pass
+
+
+# # I we want to check the table as a pandas dataframe un-comment the following lines
+# string_column_names = db.run("PRAGMA table_info('street_trees');")
+# column_names = [col.split(', ')[1].strip("'") for col in string_column_names.split('), (')]
+
+# print("\nColumn names:")
+# print(column_names)
+# print(f"\n{'-'*50}\n")
+
+# try:
+#     # Safely convert the string representation of a list of tuples 
+#     # back into a real Python list of tuples
+#     data_list_of_tuples = ast.literal_eval(db.run("SELECT * FROM street_trees LIMIT 5;"))
+
+#     # Convert the list of tuples directly into a pandas DataFrame
+#     df = pd.DataFrame(data_list_of_tuples, columns=column_names)
+
+#     print("--- Successfully Created DataFrame ---")
+
+# except ValueError as e:
+#     print(f"Error during conversion: {e}")
+#     print("The string format is likely incorrect. It must be a valid Python list representation.")
+
+
+toolkit = SQLDatabaseToolkit(db=db, llm=llm)
+
+tools = toolkit.get_tools()
+
+for my_tool in tools:
+    print(f"{my_tool.name}: {my_tool.description}\n")
+
+print(f"NO MORE TOOLS\n{'-'*50}")
+
+# Ideally this prompt would be part of another file or module
+# It should not be part of the main code running the agent
+# However, for simplicity and illustrative purposes, we include it here
+system_prompt = """
+You are an agent designed to interact with a SQL database.
+Given an input question, create a syntactically correct {dialect} query to run,
+then look at the results of the query and return the answer. Unless the user
+specifies a specific number of examples they wish to obtain, always limit your
+query to at most {top_k} results.
+
+You can order the results by a relevant column to return the most interesting
+examples in the database. Never query for all the columns from a specific table,
+only ask for the relevant columns given the question.
+
+You MUST double check your query before executing it. If you get an error while
+executing a query, rewrite the query and try again.
+
+DO NOT make any DML statements (INSERT, UPDATE, DELETE, DROP etc.) to the
+database.
+
+To start you should ALWAYS look at the tables in the database to see what you
+can query. Do NOT skip this step.
+
+Then you should query the schema of the most relevant tables.
+""".format(
+    dialect=db.dialect,
+    top_k=5,
+)
+
+
+sql_agent = create_agent(
+    model=llm,
+    tools=tools,
+    system_prompt=system_prompt,
+    state_schema=SQLAgentState,
+    checkpointer=InMemorySaver(),
+    middleware=[
+        HumanInTheLoopMiddleware(
+            interrupt_on={
+                'sql_db_query': True
+                # You can add more tools here if you want to interrupt on them as well
+            },
+            description_prefix="Tool execution requires approval",
+        ),
+    ],
+)
+
+
+# Configuration
+config = {"configurable": {"thread_id": "1"}}
+
+
+# Helper function to print section headers
+def print_header(text, symbol="="):
+    """Print a formatted header"""
+    print("\n" + symbol * 70)
+    print(f"  {text}")
+    print(symbol * 70 + "\n")
+
+def print_subheader(text):
+    """Print a formatted subheader"""
+    print("\n" + "-" * 70)
+    print(f"  {text}")
+    print("-" * 70)
+
+
+# Function to handle interrupts
+def handle_interrupt(response, config, interrupt_number=1):
+    """Handle a single interrupt and return the updated response"""
+    
+    if '__interrupt__' not in response:
+        return response, False  # No interrupt, we're done
+    
+    print_header(f"⚠️  INTERRUPT #{interrupt_number} - Human approval required!", "!")
+    
+    # Extract interrupt info
+    interrupt_obj = response['__interrupt__'][0]
+    interrupt_value = interrupt_obj.value
+    
+    # Extract tool information from the interrupt value
+    action_requests = interrupt_value.get('action_requests', [])
+    if action_requests:
+        action_request = action_requests[0]
+        tool_name = action_request.get('name', 'unknown')
+        tool_args = action_request.get('args', {})
+        description = action_request.get('description', '')
+        
+        print(f"🤖 Agent wants to call: {tool_name}")
+        print(f"\n📝 With arguments:")
+        pprint(tool_args)
+        
+        if description:
+            print(f"\n📄 Description:")
+            print(description)
+    else:
+        print("⚠️  No action requests found in interrupt")
+        return response, False
+    
+    # Get human input
+    print_subheader(f"🤔 DECISION TIME (Interrupt #{interrupt_number})")
+    print("\nWhat do you want to do?")
+    print("  1 - Approve: Let the agent execute as planned")
+    print("  2 - Reject: Stop the action and provide feedback")
+    print("  3 - Edit: Modify the content before executing")
+    
+    choice = input("\n👉 Enter your choice (1/2/3): ").strip()
+    
+    # Resume based on decision
+    print_subheader(f"⚡ RESUMING (Interrupt #{interrupt_number})...")
+    
+    if choice == "1":
+        # APPROVE
+        print("\n✅ You APPROVED the action\n")
+        new_response = sql_agent.invoke(
+            Command(resume={"decisions": [{"type": "approve"}]}),
+            config=config
+        )
+        return new_response, True
+        
+    elif choice == "2":
+        # REJECT
+        print("\n❌ You REJECTED the action")
+        feedback = input("👉 Enter your feedback message: ").strip()
+        print()
+        new_response = sql_agent.invoke(
+            Command(
+                resume={
+                    "decisions": [
+                        {
+                            "type": "reject",
+                            "message": feedback
+                        }
+                    ]
+                }
+            ),
+            config=config
+        )
+        return new_response, True
+        
+    elif choice == "3":
+        # EDIT
+        print("\n✏️  You chose to EDIT the action")
+        new_body = input("👉 Enter the new query: ").strip()
+        print()
+        new_response = sql_agent.invoke(
+            Command(
+                resume={
+                    "decisions": [
+                        {
+                            "type": "edit",
+                            "edited_action": {
+                                "name": tool_name,
+                                "args": {"query": new_body}
+                            }
+                        }
+                    ]
+                }
+            ),
+            config=config
+        )
+        return new_response, True
+        
+    else:
+        print("\n❌ Invalid choice\n")
+        return response, False
+
+
+def main():
+    """Main function to run the HITL (Human-in-the-loop) agent"""
+    
+    # PHASE 1: Initial invocation
+    print_header("🚀 PHASE 1: Starting Human-in-the-Loop Agent")
+
+    # Ideally this question would come from an external input
+    # For simplicity and illustrative purposes, we define it here
+    question = "How many types of plants are there in the street_trees database?"
+
+    
+    print("Sending initial message to agent...")
+    print(question)
+    # print("Email content: 'Hi, Donald. I will be in town tomorrow, will you have ")
+    # print("an available room in the White House? Best, Julio.'\n")
+
+
+    # for step in sql_agent.stream(
+    #     {"messages": [{"role": "user", "content": question}]},
+    #     stream_mode="values",
+    # ):
+    #     step["messages"][-1].pretty_print()
+
+
+    # response = sql_agent.invoke(
+    #     {"messages": [{"role": "user", "content": question}]},
+    #     stream_mode="values",
+    # )
+
+    response = sql_agent.invoke(
+        {"messages": [HumanMessage(content=question)]},
+        config=config
+    )
+            
+    # Handle all interrupts in a loop
+    interrupt_count = 0
+    max_interrupts = 5  # Safety limit to prevent infinite loop
+
+    while '__interrupt__' in response and interrupt_count < max_interrupts:
+        interrupt_count += 1
+        response, continued = handle_interrupt(
+            response, 
+            config, 
+            interrupt_count
+            )
+        
+        if not continued:
+            break
+    
+    # FINAL RESULT
+    print_header("🎉 FINAL RESULT")
+    pprint(response)
+
+    if '__interrupt__' in response:
+        print("⚠️  Still has pending interrupts (reached max limit or invalid choice)\n")
+        print("Interrupt details:")
+        pprint(response['__interrupt__'])
+    else:
+        print("✅ Process completed successfully!\n")
+        
+        # Show only the final messages
+        if 'messages' in response:
+            print("📧 Final Messages:")
+            print("-" * 70)
+            for msg in response['messages'][-3:]:  # Show last 3 messages
+                msg_type = msg.type.upper() if hasattr(msg, 'type') else 'MESSAGE'
+                msg_content = msg.content if hasattr(msg, 'content') else str(msg)
+                print(f"\n[{msg_type}]")
+                print(msg_content)
+                print()
+
+
+    
+    # response = sql_agent.invoke(
+    #     {
+    #         "messages": [HumanMessage(content="Please read my email and send a response.")],
+    #         "email": "Hi, Donald. I will be in town tomorrow, will you have an available room in the White House? Best, Julio."
+    #     },
+    #     config=config
+    # )
+
+
+
+    # The expected answer is just a number: 148
+    # I got the followging answer from the agent:
+    # The total number of plant types in the street_trees database is 148.
+
+    # To double check we can run the following:
+    # load the database as a pandas dataframe and run the nunique() method on the 'qSpecies' column
+    data_list_of_tuples = ast.literal_eval(db.run("SELECT * FROM street_trees;"))
+
+    string_column_names = db.run("PRAGMA table_info('street_trees');")
+    column_names = [col.split(', ')[1].strip("'") for col in string_column_names.split('), (')]
+
+    # Convert the list of tuples directly into a pandas DataFrame
+    df = pd.DataFrame(data_list_of_tuples, columns=column_names)
+
+    print(df['qSpecies'].nunique())
+    # The output should be 148
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n⚠️  Interrupted by user. Exiting...")
+    except Exception as e:
+        print(f"\n\n❌ Error occurred: {e}")
+        import traceback
+        traceback.print_exc()
